@@ -1,3 +1,5 @@
+// +build !confonly
+
 package dns
 
 import (
@@ -8,10 +10,10 @@ import (
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
-
 	"v2ray.com/core/common"
-	"v2ray.com/core/common/buf"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/protocol/dns"
+	udp_proto "v2ray.com/core/common/protocol/udp"
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/signal/pubsub"
 	"v2ray.com/core/common/task"
@@ -20,7 +22,7 @@ import (
 )
 
 type IPRecord struct {
-	IP     net.IP
+	IP     net.Address
 	Expire time.Time
 }
 
@@ -101,7 +103,9 @@ func (s *ClassicNameServer) Cleanup() error {
 	return nil
 }
 
-func (s *ClassicNameServer) HandleResponse(ctx context.Context, payload *buf.Buffer) {
+func (s *ClassicNameServer) HandleResponse(ctx context.Context, packet *udp_proto.Packet) {
+	payload := packet.Payload
+
 	var parser dnsmessage.Parser
 	header, err := parser.Start(payload.Bytes())
 	if err != nil {
@@ -149,7 +153,7 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, payload *buf.Buf
 				break
 			}
 			ips = append(ips, IPRecord{
-				IP:     net.IP(ans.A[:]),
+				IP:     net.IPAddress(ans.A[:]),
 				Expire: now.Add(time.Duration(ttl) * time.Second),
 			})
 		case dnsmessage.TypeAAAA:
@@ -159,7 +163,7 @@ func (s *ClassicNameServer) HandleResponse(ctx context.Context, payload *buf.Buf
 				break
 			}
 			ips = append(ips, IPRecord{
-				IP:     net.IP(ans.AAAA[:]),
+				IP:     net.IPAddress(ans.AAAA[:]),
 				Expire: now.Add(time.Duration(ttl) * time.Second),
 			})
 		default:
@@ -293,27 +297,19 @@ func (s *ClassicNameServer) buildMsgs(domain string, option IPOption) []*dnsmess
 	return msgs
 }
 
-func msgToBuffer2(msg *dnsmessage.Message) (*buf.Buffer, error) {
-	buffer := buf.New()
-	rawBytes := buffer.Extend(buf.Size)
-	packed, err := msg.AppendPack(rawBytes[:0])
-	if err != nil {
-		buffer.Release()
-		return nil, err
-	}
-	buffer.Resize(0, int32(len(packed)))
-	return buffer, nil
-}
-
 func (s *ClassicNameServer) sendQuery(ctx context.Context, domain string, option IPOption) {
 	newError("querying DNS for: ", domain).AtDebug().WriteToLog(session.ExportIDToError(ctx))
 
 	msgs := s.buildMsgs(domain, option)
 
 	for _, msg := range msgs {
-		b, err := msgToBuffer2(msg)
+		b, err := dns.PackMessage(msg)
 		common.Must(err)
-		s.udpServer.Dispatch(context.Background(), s.address, b)
+		udpCtx := context.Background()
+		if inbound := session.InboundFromContext(ctx); inbound != nil {
+			udpCtx = session.ContextWithInbound(udpCtx, inbound)
+		}
+		s.udpServer.Dispatch(udpCtx, s.address, b)
 	}
 }
 
@@ -323,14 +319,14 @@ func (s *ClassicNameServer) findIPsForDomain(domain string, option IPOption) []n
 	s.RUnlock()
 
 	if found && len(records) > 0 {
-		var ips []net.IP
+		var ips []net.Address
 		now := time.Now()
 		for _, rec := range records {
 			if rec.Expire.After(now) {
 				ips = append(ips, rec.IP)
 			}
 		}
-		return filterIP(ips, option)
+		return toNetIP(filterIP(ips, option))
 	}
 	return nil
 }

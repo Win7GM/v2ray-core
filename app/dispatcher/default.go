@@ -1,3 +1,5 @@
+// +build !confonly
+
 package dispatcher
 
 //go:generate errorgen
@@ -46,13 +48,22 @@ func (r *cachedReader) Cache(b *buf.Buffer) {
 	r.Unlock()
 }
 
-func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+func (r *cachedReader) readInternal() buf.MultiBuffer {
 	r.Lock()
 	defer r.Unlock()
 
 	if r.cache != nil && !r.cache.IsEmpty() {
 		mb := r.cache
 		r.cache = nil
+		return mb
+	}
+
+	return nil
+}
+
+func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb := r.readInternal()
+	if mb != nil {
 		return mb, nil
 	}
 
@@ -60,25 +71,21 @@ func (r *cachedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 }
 
 func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiBuffer, error) {
-	r.Lock()
-	defer r.Unlock()
-
-	if r.cache != nil && !r.cache.IsEmpty() {
-		mb := r.cache
-		r.cache = nil
+	mb := r.readInternal()
+	if mb != nil {
 		return mb, nil
 	}
 
 	return r.reader.ReadMultiBufferTimeout(timeout)
 }
 
-func (r *cachedReader) CloseError() {
+func (r *cachedReader) Interrupt() {
 	r.Lock()
 	if r.cache != nil {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	r.reader.CloseError()
+	r.reader.Interrupt()
 }
 
 // DefaultDispatcher is a default implementation of Dispatcher.
@@ -245,12 +252,12 @@ func sniffer(ctx context.Context, cReader *cachedReader) (SniffResult, error) {
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
-	dispatcher := d.ohm.GetDefaultHandler()
+	var handler outbound.Handler
 	if d.router != nil {
 		if tag, err := d.router.PickRoute(ctx); err == nil {
-			if handler := d.ohm.GetHandler(tag); handler != nil {
+			if h := d.ohm.GetHandler(tag); h != nil {
 				newError("taking detour [", tag, "] for [", destination, "]").WriteToLog(session.ExportIDToError(ctx))
-				dispatcher = handler
+				handler = h
 			} else {
 				newError("non existing tag: ", tag).AtWarning().WriteToLog(session.ExportIDToError(ctx))
 			}
@@ -258,5 +265,17 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			newError("default route for ", destination).WriteToLog(session.ExportIDToError(ctx))
 		}
 	}
-	dispatcher.Dispatch(ctx, link)
+
+	if handler == nil {
+		handler = d.ohm.GetDefaultHandler()
+	}
+
+	if handler == nil {
+		newError("default outbound handler not exist").WriteToLog(session.ExportIDToError(ctx))
+		common.Close(link.Writer)
+		common.Interrupt(link.Reader)
+		return
+	}
+
+	handler.Dispatch(ctx, link)
 }

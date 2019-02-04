@@ -6,7 +6,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"v2ray.com/core/common"
-	"v2ray.com/core/common/compare"
 	. "v2ray.com/core/common/uuid"
 	. "v2ray.com/ext/assert"
 )
@@ -33,8 +32,8 @@ func TestParseString(t *testing.T) {
 
 	uuid, err := ParseString(str)
 	common.Must(err)
-	if err := compare.BytesEqualWithDetail(expectedBytes, uuid.Bytes()); err != nil {
-		t.Fatal(err)
+	if r := cmp.Diff(expectedBytes, uuid.Bytes()); r != "" {
+		t.Fatal(r)
 	}
 
 	_, err = ParseString("2418d087")
@@ -54,7 +53,7 @@ func TestNewUUID(t *testing.T) {
 	uuid := New()
 	uuid2, err := ParseString(uuid.String())
 
-	assert(err, IsNil)
+	common.Must(err)
 	assert(uuid.String(), Equals, uuid2.String())
 	assert(uuid.Bytes(), Equals, uuid2.Bytes())
 }
